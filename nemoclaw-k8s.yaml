@@ -65,22 +65,142 @@ spec:
             - sh
             - -c
             - |
-              apk add --no-cache nftables
+              apk add --no-cache nftables socat
 
-              # Use K8s CoreDNS directly as Docker's DNS — nftables MASQUERADE rewrites the
-              # source IP (172.17.x.x → pod IP) so CoreDNS accepts queries from Docker containers.
-              NAMESERVER=$(grep nameserver /etc/resolv.conf | head -1 | awk '{print $2}')
-              echo "DNS upstream (CoreDNS): ${NAMESERVER}"
-              echo "{\"default-cgroupns-mode\":\"host\",\"dns\":[\"${NAMESERVER}\"]}" > /etc/docker/daemon.json
+              POD_IP=$(hostname -i | awk '{print $1}')
+              NAMESERVER=$(grep '^nameserver' /etc/resolv.conf | awk '{print $2}' | grep -v '^127\.' | head -1)
+              [ -z "$NAMESERVER" ] && NAMESERVER="8.8.8.8"
+              echo "Pod IP: ${POD_IP}"
+              echo "DNS upstream: ${NAMESERVER}"
 
-              # Set up nftables MASQUERADE for all Docker bridge traffic (172.16.0.0/12 covers
-              # Docker's default bridge range: 172.17-31.x.x). This allows inner Docker containers
-              # (openshell cluster nodes) to reach external registries and K8s services.
-              # iptables MASQUERADE is broken on k3s/rke2 (nftables-based), so we use nft directly.
+              # default-address-pools: restrict Docker bridge allocation to 172.16.0.0/12 and
+              # 192.168.0.0/16 only.
+              #
+              # dns: use the detected outer nameserver directly.
+              printf '%s\n' \
+                '{"default-cgroupns-mode":"host",' \
+                "\"dns\":[\"${NAMESERVER}\"]," \
+                '"default-address-pools":[{"base":"172.16.0.0/12","size":24},{"base":"192.168.0.0/16","size":24}]}' \
+                > /etc/docker/daemon.json
+
+              # Set up nftables MASQUERADE for Docker bridge traffic (172.16/12, 192.168/16).
+              # Ensure FORWARD is open for bridge traffic.
               nft add table ip nat 2>/dev/null || true
               nft 'add chain ip nat POSTROUTING { type nat hook postrouting priority 100; }' 2>/dev/null || true
               nft 'add rule ip nat POSTROUTING ip saddr 172.16.0.0/12 masquerade' 2>/dev/null || true
-              echo "nftables MASQUERADE rules applied for 172.16.0.0/12"
+              nft 'add rule ip nat POSTROUTING ip saddr 192.168.0.0/16 masquerade' 2>/dev/null || true
+
+              nft add table ip filter 2>/dev/null || true
+              nft 'add chain ip filter FORWARD { type filter hook forward priority 0; policy accept; }' 2>/dev/null || true
+              echo "nftables rules applied for Docker networking"
+
+              # Prepare files for injection into openshell k3s containers on start:
+              # config.yaml: host-gw flannel (avoids vxlan race/deletion in DinD) + disable
+              #   unnecessary components (traefik/metrics/servicelb) so CoreDNS gets scheduled
+              #   before openshell's ~14s internal health-check timeout.
+              #   NOTE: We use 10.44/10.45 ranges to avoid overlap with outer cluster (10.42/10.43).
+              # flannel/subnet.env: pre-seed with deterministic single-node values.
+              mkdir -p /tmp/k3s-config/flannel
+              printf '%s\n' \
+                'cluster-cidr: 10.44.0.0/16' \
+                'service-cidr: 10.45.0.0/16' \
+                'cluster-dns: 10.45.0.10' \
+                'flannel-backend: host-gw' \
+                'disable:' \
+                '  - traefik' \
+                '  - metrics-server' \
+                '  - servicelb' \
+                '  - local-storage' \
+                'kubelet-arg:' \
+                '  - "serialize-image-pulls=false"' \
+                > /tmp/k3s-config/config.yaml
+              printf 'FLANNEL_NETWORK=10.44.0.0/16\nFLANNEL_SUBNET=10.44.0.0/24\nFLANNEL_MTU=1500\nFLANNEL_IPMASQ=true\n' \
+                > /tmp/k3s-config/flannel/subnet.env
+              (
+                while ! docker info >/dev/null 2>&1; do sleep 1; done
+
+                # Pre-pull pause image into DinD docker BEFORE openshell starts.
+                # DinD docker storage (/var/lib/docker) is an emptyDir that persists across
+                # openshell container restarts within the same pod, so after the first pull
+                # every subsequent retry gets a cache hit.
+                (
+                  echo "[k3s-inject] Pre-pulling rancher/mirrored-pause:3.6..."
+                  docker pull rancher/mirrored-pause:3.6 2>&1 | tail -2 || true
+                  docker save rancher/mirrored-pause:3.6 > /tmp/k3s-pause.tar 2>/dev/null && \
+                    echo "[k3s-inject] Pause image saved ($(du -sh /tmp/k3s-pause.tar | cut -f1))" || \
+                    echo "[k3s-inject] WARNING: pause image save failed"
+                ) &
+
+                echo "[k3s-inject] Watching for openshell containers..."
+                docker events --filter type=container --filter event=start \
+                  --format '{{.ID}}' 2>/dev/null | while read -r CID; do
+                  NAME=$(docker inspect --format '{{.Name}}' "$CID" 2>/dev/null | tr -d '/')
+                  if echo "$NAME" | grep -qi "openshell"; then
+                    echo "[k3s-inject] Detected: $NAME ($CID) — injecting k3s config + subnet.env"
+                    docker exec "$CID" mkdir -p /etc/rancher/k3s 2>/dev/null || true
+                    docker cp /tmp/k3s-config/config.yaml \
+                      "$CID":/etc/rancher/k3s/config.yaml 2>/dev/null && \
+                      echo "[k3s-inject] Done: k3s config injected into $NAME" || \
+                      echo "[k3s-inject] WARNING: k3s config inject failed for $NAME"
+                    docker cp /tmp/k3s-config/flannel/. \
+                      "$CID":/run/flannel 2>/dev/null && \
+                      echo "[k3s-inject] Done: subnet.env pre-created in $NAME" || \
+                      echo "[k3s-inject] WARNING: subnet.env pre-create failed for $NAME"
+
+                    # Inject pre-pulled images into k3s auto-import directory.
+                    # k3s imports every *.tar from /var/lib/rancher/k3s/agent/images/ during
+                    # agent init — before the kubelet tries to create any pod sandbox.
+                    # /var/lib/rancher/k3s/agent/ is created by k3s a fraction of a second
+                    # after container start, so retry mkdir until it succeeds (max 3s).
+                    mkdir -p /tmp/k3s-images-inject
+                    for img in pause coredns; do
+                      [ -f /tmp/k3s-${img}.tar ] && cp /tmp/k3s-${img}.tar /tmp/k3s-images-inject/${img}.tar
+                    done
+                    STAGED=0
+                    for i in $(seq 1 10); do
+                      docker exec "$CID" mkdir -p /var/lib/rancher/k3s/agent/images 2>/dev/null && \
+                        tar cf - -C /tmp/k3s-images-inject . | \
+                          docker cp - "$CID":/var/lib/rancher/k3s/agent/images/ 2>/dev/null && \
+                        STAGED=1 && break
+                      sleep 0.3
+                    done
+                    if [ "$STAGED" = "1" ]; then
+                      echo "[k3s-inject] Done: images staged for $NAME ($(ls /tmp/k3s-images-inject/*.tar 2>/dev/null | xargs -I{} basename {} .tar | tr '\n' ' '))"
+                    else
+                      echo "[k3s-inject] WARNING: images staging failed for $NAME after retries"
+                    fi
+
+                    # Background: discover coredns image from manifest, pull into DinD docker
+                    # cache (persists across openshell restarts — emptyDir survives pod-internal
+                    # restarts), save to /tmp/k3s-coredns.tar for injection on the NEXT attempt.
+                    # Attempt 1: pulls the image (may be slow, doesn't affect this run).
+                    # Attempt 2+: image already in docker cache → save is instant → staged before
+                    # k3s agent scans images dir → CoreDNS available without any pull.
+                    (
+                      CID_LOCAL="$CID"; NAME_LOCAL="$NAME"
+                      COREDNS_IMAGE=""
+                      for i in $(seq 1 40); do
+                        COREDNS_IMAGE=$(docker cp \
+                          "$CID_LOCAL":/var/lib/rancher/k3s/server/manifests/coredns.yaml \
+                          - 2>/dev/null | tar Oxf - 2>/dev/null | \
+                          grep 'image:' | grep -v '#' | awk '{print $NF}' | grep -i coredns | tr -d '"' | head -1)
+                        [ -n "$COREDNS_IMAGE" ] && break
+                        sleep 0.5
+                      done
+                      [ -z "$COREDNS_IMAGE" ] && {
+                        echo "[k3s-inject] WARNING: no coredns image found for $NAME_LOCAL"
+                        exit 0
+                      }
+                      echo "[k3s-inject] Found coredns image: $COREDNS_IMAGE for $NAME_LOCAL"
+                      docker image inspect "$COREDNS_IMAGE" >/dev/null 2>&1 || \
+                        { docker pull "$COREDNS_IMAGE" 2>&1 | tail -2 || true; }
+                      docker save "$COREDNS_IMAGE" > /tmp/k3s-coredns.tar 2>/dev/null && \
+                        echo "[k3s-inject] Coredns image cached ($(du -sh /tmp/k3s-coredns.tar | cut -f1)) — ready for next attempt" || \
+                        echo "[k3s-inject] WARNING: coredns image save failed"
+                    ) &
+                  fi
+                done
+              ) &
 
               exec dockerd --host=unix:///var/run/docker.sock
           volumeMounts:

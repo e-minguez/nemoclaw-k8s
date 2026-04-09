@@ -1,9 +1,9 @@
 # NemoClaw on Kubernetes
 
-> **⚠️ Work in progress — not fully working yet.**
-> The DinD networking and Ollama integration are functional, but the openshell gateway
-> still fails its internal DNS health check (`Cluster DNS resolution failed`) on k3s/rke2.
-> Investigation is ongoing — see [AGENTS.md](AGENTS.md) for the full debugging history.
+> **⚠️ Status: Not working — Investigation in progress.**
+> Despite CIDR separation and direct DNS configuration, the openshell gateway
+> still fails with `Cluster DNS resolution failed` and `network unreachable` (172.16.1.2:6443)
+> on k3s/rke2 clusters. See [AGENTS.md](AGENTS.md) for the latest technical findings.
 
 Kubernetes manifests for running [NemoClaw](https://nvidia.com/nemoclaw) on a k3s/rke2 cluster using Docker-in-Docker (DinD) for sandbox isolation.
 
@@ -55,13 +55,15 @@ The pod runs two containers sharing volumes for the Docker socket:
 │  └─────────────┘        └────────────────────┘  │
 │         │                        │              │
 │    DinD bridge             K8s pod network       │
-│    172.17.0.0/16           (Ollama FQDN)         │
+│    172.16.0.0/12           (Ollama FQDN)         │
 └─────────────────────────────────────────────────┘
 ```
 
-**nftables MASQUERADE** (`dind` container): Docker's iptables-based MASQUERADE is broken on k3s/rke2 (nftables-based nodes). An nft rule rewrites the source IP of all Docker bridge traffic (`172.16.0.0/12 → pod IP`) so inner containers can reach K8s CoreDNS and external registries. The CoreDNS IP is configured directly in `daemon.json`.
+**CIDR Separation:** The inner k3s cluster is configured with `10.44.0.0/16` (Pod) and `10.45.0.0/16` (Service) to avoid conflicts with the outer cluster's `10.42/10.43` ranges.
 
-**Ollama TCP proxy** (`workspace` container): socat listens on `127.0.0.1:11434` and forwards TCP to the Ollama K8s service FQDN. The hostname `host.openshell.internal` is added to `/etc/hosts` so the NemoClaw installer can reach Ollama via the stable hostname it expects.
+**Direct DNS:** The `dind` script detects the outer nameserver and injects it directly into Docker's `daemon.json`, ensuring consistent resolution for inner containers.
+
+**nftables MASQUERADE:** An nft rule rewrites the source IP of all Docker bridge traffic (`172.16.0.0/12 → pod IP`) and explicitly allows `FORWARD` traffic to ensure inner containers can reach external registries and the control plane.
 
 ## Notes
 
@@ -70,4 +72,3 @@ The pod runs two containers sharing volumes for the Docker socket:
   kubectl label ns nemoclaw pod-security.kubernetes.io/enforce=privileged
   ```
 - `replicas: 1` only — multiple replicas on the same node would conflict on the Docker bridge subnet.
-- No external internet access is required. All image pulls and DNS resolution flow through the cluster network.

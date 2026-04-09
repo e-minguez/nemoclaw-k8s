@@ -11,58 +11,50 @@ The original manifest used `kind: Pod`. This was changed to `kind: Deployment` f
 - **Standard practice**: `Deployment` is the recommended workload primitive for long-running processes in Kubernetes. Bare pods are generally only used for one-shot jobs or debugging.
 - **ConfigMap decoupling**: Moving env vars to a `ConfigMap` pairs naturally with `Deployment` — the ConfigMap can be updated and the deployment restarted independently, without touching the pod spec.
 
-The `restartPolicy: Never` from the original pod was removed; it is not valid on `Deployment` pods, and the `Always` default is appropriate here.
+## Network Architecture & CIDR Separation
 
-## Why a ConfigMap
+The original manifest assumed a Docker-enabled host. On k3s/rke2 clusters, several networking issues arose due to overlapping CIDRs.
 
-All environment variables were extracted from the inline `env:` blocks into a `ConfigMap` (`nemoclaw-config`):
+### The Problem: Overlapping CIDRs
 
-- **Separation of concerns**: Configuration is decoupled from the workload spec. Cluster operators can update endpoint URLs or model names without editing the Deployment manifest.
-- **Reusability**: Both `dind` and `workspace` containers share the same ConfigMap via `envFrom`, eliminating duplication.
-- **Auditability**: ConfigMap changes are visible in `kubectl describe` and version-controlled separately.
+By default, k3s uses `10.42.0.0/16` for Pods and `10.43.0.0/16` for Services. If the inner k3s cluster (running inside DinD) uses the same defaults, routing becomes ambiguous. Packets destined for the inner cluster might be routed to the outer cluster and vice-versa.
 
-## DinD DNS proxy (k3s/rke2 compatibility)
+### The Solution: Explicit CIDR Separation
 
-The original manifest assumed a Docker-enabled host. On k3s/rke2 clusters (which use `containerd`, not Docker), several networking issues arose:
+We now explicitly configure the inner k3s cluster to use non-conflicting ranges:
+- **Cluster CIDR:** `10.44.0.0/16`
+- **Service CIDR:** `10.45.0.0/16`
+- **Cluster DNS:** `10.45.0.10`
 
-### Problem 1: CoreDNS unreachable from DinD bridge (`operation not permitted`)
+These are injected via `/etc/rancher/k3s/config.yaml` and `flannel/subnet.env` inside the openshell container.
 
-Containers running inside DinD get IPs on Docker's internal bridge network (`172.17.0.x`). By default, Docker configures these containers to use the K8s CoreDNS server (inherited from the pod's `/etc/resolv.conf`, e.g. `10.43.0.10`). However, the DinD bridge network cannot route UDP packets to the K8s cluster network — resulting in `write: operation not permitted`.
+## DNS Strategy
 
-### Problem 2: External DNS unreachable (`i/o timeout` / `network is unreachable`)
+### Direct DNS via daemon.json
 
-Switching to public DNS (`8.8.8.8`) didn't help either. On k3s/rke2 nodes, Docker's `iptables MASQUERADE` rules for the bridge network conflict with the node's `nftables`-based CNI setup. Packets from `172.17.0.x` reach the socket but responses never return, or the network is entirely unreachable.
+Previously, a `socat` UDP/TCP proxy was used to bridge DNS queries. This was found to be fragile. The current approach is more direct:
 
-### Solution: socat UDP DNS proxy on the bridge gateway
+1.  **Upstream Detection:** The `dind` startup script detects the real upstream nameserver from `/etc/resolv.conf` (ignoring `127.0.0.1`).
+2.  **Docker Configuration:** This nameserver is injected directly into Docker's `daemon.json` under the `"dns"` key.
+3.  **Result:** Containers started by Docker (including the openshell gateway) inherit this upstream DNS directly, bypassing the need for a local proxy.
 
-The `dind` container now runs a socat UDP proxy that:
+## nftables and Forwarding
 
-1. Listens on `0.0.0.0:53` (i.e. the docker0 bridge gateway `172.17.0.1`, which is always directly reachable by DinD containers — no NAT needed)
-2. Forwards queries to the K8s CoreDNS server read from `/etc/resolv.conf`
+Docker's `iptables` rules often conflict with k3s's `nftables` setup. We use `nft` directly to:
+1.  **MASQUERADE:** Ensure traffic from Docker bridge networks (`172.16.0.0/12`, `192.168.0.0/16`) is masqueraded to the pod's IP.
+2.  **FORWARD:** Explicitly set the `FORWARD` chain policy to `accept` to ensure packets can flow between the Docker bridges and the pod's `eth0`.
 
-`daemon.json` is configured with `dns: ["172.17.0.1"]` so all DinD containers use this proxy. CoreDNS resolves both external registries (`ghcr.io`, `docker.io`) and cluster FQDNs.
+## Current Status: Still Not Working
 
-```
-DinD container (172.17.0.x)
-  → UDP:53 to 172.17.0.1 (bridge gateway, no NAT required)
-    → socat in dind container
-      → UDP:53 to K8s CoreDNS (pod network, always reachable)
-        → resolves ghcr.io, docker.io, cluster FQDNs ✅
-```
+Despite these changes, the deployment fails with:
+- **`Cluster DNS resolution failed`**: The openshell installer reports this even when DNS seems to be resolving.
+- **`network is unreachable`**: Logs show `dial tcp 172.16.1.2:6443: connect: network is unreachable`. This suggests that the inner k3s node cannot reach its own control plane IP or that the tunnel setup is failing.
 
-### Why not `hostNetwork: true`?
+### Next Investigation Steps:
+- Verify if `172.16.x.x` routes are being correctly installed inside the `dind` container.
+- Check for `iptables` vs `nftables` conflicts specifically in the `FORWARD` chain.
+- Investigate why the health check thinks DNS is failing even when `ghcr.io` resolution is successful.
 
-`hostNetwork: true` was tried but caused a different issue: on pod restart, a stale `docker0` bridge interface from the previous run persists in the host network namespace. Docker detects the existing interface, ignores the `bip` setting in `daemon.json`, and reuses the old bridge IP — breaking the DNS proxy binding. Keeping a clean pod network namespace (no `hostNetwork`) avoids this entirely.
+## k3s image pre-loading
 
-## Dynamo TCP proxy
-
-The `workspace` container runs a socat TCP proxy to bridge the NemoClaw installer to the Dynamo vLLM frontend:
-
-```
-NemoClaw installer → http://host.openshell.internal:8000/v1
-  → /etc/hosts: host.openshell.internal = 127.0.0.1
-    → socat TCP on 127.0.0.1:8000 (bound to loopback only, not exposed on node)
-      → TCP to vllm-disagg-frontend.dynamo.svc.cluster.local:8000
-```
-
-The `bind=127.0.0.1` constraint on socat ensures port 8000 is not exposed beyond the pod's loopback, even if `hostNetwork` were re-enabled in the future.
+The `k3s-inject` watcher still handles pre-pulling and injecting the `pause` and `coredns` images to speed up k3s startup and help meet the tight health-check window (~14s).
