@@ -1,0 +1,150 @@
+# NemoClaw on Kubernetes
+# Uses official installer with Docker-in-Docker for sandbox isolation.
+# Prerequisites: kubectl create namespace nemoclaw
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: nemoclaw-config
+  namespace: nemoclaw
+data:
+  DOCKER_TLS_CERTDIR: ""
+  DOCKER_HOST: "unix:///var/run/docker.sock"
+  # Dynamo endpoint (raw host:port for socat) - UPDATE THIS FOR YOUR CLUSTER
+  DYNAMO_HOST: "vllm-disagg-frontend.dynamo.svc.cluster.local:8000"
+  # NemoClaw config (uses host.openshell.internal via socat)
+  NEMOCLAW_NON_INTERACTIVE: "1"
+  NEMOCLAW_PROVIDER: "custom"
+  NEMOCLAW_ENDPOINT_URL: "http://host.openshell.internal:8000/v1"
+  COMPATIBLE_API_KEY: "dummy"
+  NEMOCLAW_MODEL: "meta-llama/Llama-3.1-8B-Instruct"
+  NEMOCLAW_SANDBOX_NAME: "my-assistant"
+  NEMOCLAW_POLICY_MODE: "skip"
+  NEMOCLAW_ACCEPT_THIRD_PARTY_SOFTWARE: "1"
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: nemoclaw
+  namespace: nemoclaw
+  labels:
+    app: nemoclaw
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: nemoclaw
+  template:
+    metadata:
+      labels:
+        app: nemoclaw
+    spec:
+      initContainers:
+        # Configure Docker daemon: cgroup v2 + use default bridge IP (172.17.0.1) as DNS upstream
+        - name: init-docker-config
+          image: busybox
+          command: ["sh", "-c", "echo '{\"default-cgroupns-mode\":\"host\",\"dns\":[\"172.17.0.1\"]}' > /etc/docker/daemon.json"]
+          volumeMounts:
+            - name: docker-config
+              mountPath: /etc/docker
+
+      containers:
+        # Docker daemon (DinD)
+        - name: dind
+          image: docker:24-dind
+          securityContext:
+            privileged: true
+          envFrom:
+            - configMapRef:
+                name: nemoclaw-config
+          command:
+            - sh
+            - -c
+            - |
+              # Install socat for DNS proxy
+              apk add --no-cache socat
+
+              # Resolve the pod's actual nameserver (K8s CoreDNS, reachable from pod network)
+              NAMESERVER=$(grep nameserver /etc/resolv.conf | head -1 | awk '{print $2}')
+              echo "DNS upstream: ${NAMESERVER}"
+
+              # Start dockerd in background; docker0 will use default 172.17.0.1 in a clean pod namespace
+              dockerd --host=unix:///var/run/docker.sock &
+              DOCKERD_PID=$!
+
+              # Wait for docker0 bridge to come up, then start UDP DNS proxy on the gateway
+              echo "Waiting for docker0 bridge..."
+              while ! ip addr show docker0 >/dev/null 2>&1; do sleep 1; done
+              echo "docker0 ready. Starting DNS proxy 0.0.0.0:53 -> ${NAMESERVER}:53"
+              socat UDP4-LISTEN:53,reuseaddr,fork UDP4:${NAMESERVER}:53 &
+
+              wait ${DOCKERD_PID}
+          volumeMounts:
+            - name: docker-storage
+              mountPath: /var/lib/docker
+            - name: docker-socket
+              mountPath: /var/run
+            - name: docker-config
+              mountPath: /etc/docker
+          resources:
+            requests:
+              memory: "8Gi"
+              cpu: "2"
+
+        # Workspace - runs official NemoClaw installer
+        - name: workspace
+          image: node:22
+          command:
+            - bash
+            - -c
+            - |
+              set -e
+
+              # Install packages
+              echo "[1/4] Installing packages..."
+              apt-get update -qq
+              apt-get install -y -qq docker.io socat curl >/dev/null 2>&1
+
+              # Start socat proxy for K8s DNS bridge
+              echo "[2/4] Starting socat proxy..."
+              socat TCP-LISTEN:8000,bind=127.0.0.1,fork,reuseaddr TCP:$DYNAMO_HOST &
+              # Add hosts entry so validation can reach socat via host.openshell.internal
+              echo "127.0.0.1 host.openshell.internal" >> /etc/hosts
+              sleep 1
+
+              # Wait for Docker
+              echo "[3/4] Waiting for Docker daemon..."
+              for i in $(seq 1 30); do
+                if docker info >/dev/null 2>&1; then break; fi
+                sleep 2
+              done
+              docker info >/dev/null 2>&1 || { echo "Docker not ready"; exit 1; }
+              echo "Docker ready"
+
+              # Run official NemoClaw installer
+              echo "[4/4] Running NemoClaw installer..."
+              curl -fsSL https://nvidia.com/nemoclaw.sh | bash
+
+              # Keep running after onboard
+              echo "Onboard complete. Container staying alive."
+              exec sleep infinity
+          envFrom:
+            - configMapRef:
+                name: nemoclaw-config
+          volumeMounts:
+            - name: docker-socket
+              mountPath: /var/run
+            - name: docker-config
+              mountPath: /etc/docker
+          resources:
+            requests:
+              memory: "4Gi"
+              cpu: "2"
+
+      volumes:
+        - name: docker-storage
+          emptyDir: {}
+        - name: docker-socket
+          emptyDir: {}
+        - name: docker-config
+          emptyDir: {}
