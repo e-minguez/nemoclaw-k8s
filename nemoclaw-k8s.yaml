@@ -1,6 +1,12 @@
 # NemoClaw on Kubernetes
 # Uses official installer with Docker-in-Docker for sandbox isolation.
-# Prerequisites: kubectl create namespace nemoclaw
+---
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: nemoclaw
+  labels:
+    pod-security.kubernetes.io/enforce: privileged
 ---
 apiVersion: v1
 kind: ConfigMap
@@ -10,14 +16,12 @@ metadata:
 data:
   DOCKER_TLS_CERTDIR: ""
   DOCKER_HOST: "unix:///var/run/docker.sock"
-  # Dynamo endpoint (raw host:port for socat) - UPDATE THIS FOR YOUR CLUSTER
-  DYNAMO_HOST: "vllm-disagg-frontend.dynamo.svc.cluster.local:8000"
-  # NemoClaw config (uses host.openshell.internal via socat)
+  # Ollama service endpoint (raw host:port for socat) - UPDATE THIS FOR YOUR CLUSTER
+  OLLAMA_SERVICE: "ollama.ollama-system.svc.cluster.local:11434"
+  # NemoClaw config (uses host.openshell.internal:11434 via socat)
   NEMOCLAW_NON_INTERACTIVE: "1"
-  NEMOCLAW_PROVIDER: "custom"
-  NEMOCLAW_ENDPOINT_URL: "http://host.openshell.internal:8000/v1"
-  COMPATIBLE_API_KEY: "dummy"
-  NEMOCLAW_MODEL: "meta-llama/Llama-3.1-8B-Instruct"
+  NEMOCLAW_PROVIDER: "ollama"
+  NEMOCLAW_MODEL: "qwen2.5:14b"
   NEMOCLAW_SANDBOX_NAME: "my-assistant"
   NEMOCLAW_POLICY_MODE: "skip"
   NEMOCLAW_ACCEPT_THIRD_PARTY_SOFTWARE: "1"
@@ -40,10 +44,10 @@ spec:
         app: nemoclaw
     spec:
       initContainers:
-        # Configure Docker daemon: cgroup v2 + use default bridge IP (172.17.0.1) as DNS upstream
+        # Configure Docker daemon for cgroup v2 compatibility
         - name: init-docker-config
           image: busybox
-          command: ["sh", "-c", "echo '{\"default-cgroupns-mode\":\"host\",\"dns\":[\"172.17.0.1\"]}' > /etc/docker/daemon.json"]
+          command: ["sh", "-c", "echo '{\"default-cgroupns-mode\":\"host\"}' > /etc/docker/daemon.json"]
           volumeMounts:
             - name: docker-config
               mountPath: /etc/docker
@@ -61,24 +65,29 @@ spec:
             - sh
             - -c
             - |
-              # Install socat for DNS proxy
               apk add --no-cache socat
 
-              # Resolve the pod's actual nameserver (K8s CoreDNS, reachable from pod network)
+              # Get the pod's own IP — this is a LOCAL address in DinD's network namespace.
+              # Any container on ANY Docker bridge can route to it without NAT or cross-bridge
+              # forwarding (DinD kernel delivers it as local, bypassing DOCKER-ISOLATION rules).
+              POD_IP=$(ip addr show eth0 | grep 'inet ' | awk '{print $2}' | cut -d/ -f1)
+              echo "Pod IP: ${POD_IP}"
+
+              # Overwrite daemon.json: cgroup v2 + pod IP as DNS (works for ALL Docker networks)
+              echo "{\"default-cgroupns-mode\":\"host\",\"dns\":[\"${POD_IP}\"]}" > /etc/docker/daemon.json
+
+              # Get K8s CoreDNS from pod resolv.conf (reachable from DinD's own network namespace)
               NAMESERVER=$(grep nameserver /etc/resolv.conf | head -1 | awk '{print $2}')
               echo "DNS upstream: ${NAMESERVER}"
 
-              # Start dockerd in background; docker0 will use default 172.17.0.1 in a clean pod namespace
-              dockerd --host=unix:///var/run/docker.sock &
-              DOCKERD_PID=$!
+              # Allow DNS reply packets through Docker's FORWARD chain (both directions)
+              iptables -I FORWARD -p udp --dport 53 -j ACCEPT 2>/dev/null || true
+              iptables -I FORWARD -p udp --sport 53 -j ACCEPT 2>/dev/null || true
 
-              # Wait for docker0 bridge to come up, then start UDP DNS proxy on the gateway
-              echo "Waiting for docker0 bridge..."
-              while ! ip addr show docker0 >/dev/null 2>&1; do sleep 1; done
-              echo "docker0 ready. Starting DNS proxy 0.0.0.0:53 -> ${NAMESERVER}:53"
+              # Start DNS proxy before dockerd — listens on all interfaces including pod eth0
               socat UDP4-LISTEN:53,reuseaddr,fork UDP4:${NAMESERVER}:53 &
 
-              wait ${DOCKERD_PID}
+              exec dockerd --host=unix:///var/run/docker.sock
           volumeMounts:
             - name: docker-storage
               mountPath: /var/lib/docker
@@ -101,19 +110,27 @@ spec:
               set -e
 
               # Install packages
-              echo "[1/4] Installing packages..."
+              echo "[1/5] Installing packages..."
               apt-get update -qq
               apt-get install -y -qq docker.io socat curl >/dev/null 2>&1
 
-              # Start socat proxy for K8s DNS bridge
-              echo "[2/4] Starting socat proxy..."
-              socat TCP-LISTEN:8000,bind=127.0.0.1,fork,reuseaddr TCP:$DYNAMO_HOST &
-              # Add hosts entry so validation can reach socat via host.openshell.internal
+              # Start socat proxy: forwards host.openshell.internal:11434 -> Ollama K8s service
+              echo "[2/5] Starting Ollama socat proxy..."
+              socat TCP-LISTEN:11434,bind=127.0.0.1,fork,reuseaddr TCP:$OLLAMA_SERVICE &
               echo "127.0.0.1 host.openshell.internal" >> /etc/hosts
               sleep 1
 
+              # Pre-pull the model into Ollama before the installer validates it
+              echo "[3/5] Pre-pulling model ${NEMOCLAW_MODEL} into Ollama (this may take a while)..."
+              curl -sf -X POST http://$OLLAMA_SERVICE/api/pull \
+                -H "Content-Type: application/json" \
+                -d "{\"model\":\"${NEMOCLAW_MODEL}\",\"stream\":false}" \
+                | tail -c 200
+              echo ""
+              echo "Model pull complete."
+
               # Wait for Docker
-              echo "[3/4] Waiting for Docker daemon..."
+              echo "[4/5] Waiting for Docker daemon..."
               for i in $(seq 1 30); do
                 if docker info >/dev/null 2>&1; then break; fi
                 sleep 2
@@ -122,7 +139,7 @@ spec:
               echo "Docker ready"
 
               # Run official NemoClaw installer
-              echo "[4/4] Running NemoClaw installer..."
+              echo "[5/5] Running NemoClaw installer..."
               curl -fsSL https://nvidia.com/nemoclaw.sh | bash
 
               # Keep running after onboard

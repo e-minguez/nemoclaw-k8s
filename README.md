@@ -9,22 +9,15 @@ Kubernetes manifests for running [NemoClaw](https://nvidia.com/nemoclaw) on a k3
 | `nemoclaw-k8s.yaml` | Production manifest: `ConfigMap` + `Deployment` |
 | `nemoclaw-k8s-orig.yaml` | Original reference manifest (`Pod`-based) |
 
-## Prerequisites
-
-```bash
-kubectl create namespace nemoclaw
-```
-
 ## Usage
 
 1. Edit the `nemoclaw-config` ConfigMap in `nemoclaw-k8s.yaml` to match your cluster:
 
    | Key | Description |
    |---|---|
-   | `DYNAMO_HOST` | `host:port` of your vLLM/Dynamo frontend service |
-   | `NEMOCLAW_MODEL` | Model name to use |
+   | `OLLAMA_SERVICE` | `host:port` of your Ollama service (default: `ollama.ollama-system.svc.cluster.local:11434`) |
+   | `NEMOCLAW_MODEL` | Ollama model tag to pull and use (e.g. `qwen2.5:14b`) |
    | `NEMOCLAW_SANDBOX_NAME` | Name for the NemoClaw sandbox |
-   | `COMPATIBLE_API_KEY` | API key for the endpoint |
 
 2. Apply:
    ```bash
