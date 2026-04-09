@@ -1,5 +1,10 @@
 # NemoClaw on Kubernetes
 
+> **⚠️ Work in progress — not fully working yet.**
+> The DinD networking and Ollama integration are functional, but the openshell gateway
+> still fails its internal DNS health check (`Cluster DNS resolution failed`) on k3s/rke2.
+> Investigation is ongoing — see [AGENTS.md](AGENTS.md) for the full debugging history.
+
 Kubernetes manifests for running [NemoClaw](https://nvidia.com/nemoclaw) on a k3s/rke2 cluster using Docker-in-Docker (DinD) for sandbox isolation.
 
 ## Files
@@ -45,18 +50,18 @@ The pod runs two containers sharing volumes for the Docker socket:
 │  │    dind     │        │     workspace      │  │
 │  │             │        │                    │  │
 │  │  dockerd ───┼──sock──┼─▶ docker CLI       │  │
-│  │  socat DNS  │        │  socat TCP proxy   │  │
-│  │  proxy      │        │  NemoClaw installer│  │
+│  │  nftables   │        │  socat TCP proxy   │  │
+│  │  MASQUERADE │        │  NemoClaw installer│  │
 │  └─────────────┘        └────────────────────┘  │
 │         │                        │              │
 │    DinD bridge             K8s pod network       │
-│    172.17.0.0/16           (Dynamo FQDN)         │
+│    172.17.0.0/16           (Ollama FQDN)         │
 └─────────────────────────────────────────────────┘
 ```
 
-**DinD DNS proxy** (`dind` container): socat listens on `0.0.0.0:53` (the docker0 bridge gateway) and forwards UDP DNS queries to the K8s CoreDNS server. This allows containers running inside DinD to resolve image registries and cluster FQDNs without needing external internet access or NAT routing.
+**nftables MASQUERADE** (`dind` container): Docker's iptables-based MASQUERADE is broken on k3s/rke2 (nftables-based nodes). An nft rule rewrites the source IP of all Docker bridge traffic (`172.16.0.0/12 → pod IP`) so inner containers can reach K8s CoreDNS and external registries. The CoreDNS IP is configured directly in `daemon.json`.
 
-**Dynamo TCP proxy** (`workspace` container): socat listens on `127.0.0.1:8000` and forwards TCP to the Dynamo vLLM frontend service FQDN. The hostname `host.openshell.internal` is added to `/etc/hosts` pointing to `127.0.0.1` so the NemoClaw installer can reach the endpoint via a stable hostname.
+**Ollama TCP proxy** (`workspace` container): socat listens on `127.0.0.1:11434` and forwards TCP to the Ollama K8s service FQDN. The hostname `host.openshell.internal` is added to `/etc/hosts` so the NemoClaw installer can reach Ollama via the stable hostname it expects.
 
 ## Notes
 

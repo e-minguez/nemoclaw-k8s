@@ -65,27 +65,22 @@ spec:
             - sh
             - -c
             - |
-              apk add --no-cache socat
+              apk add --no-cache nftables
 
-              # Get the pod's own IP — this is a LOCAL address in DinD's network namespace.
-              # Any container on ANY Docker bridge can route to it without NAT or cross-bridge
-              # forwarding (DinD kernel delivers it as local, bypassing DOCKER-ISOLATION rules).
-              POD_IP=$(ip addr show eth0 | grep 'inet ' | awk '{print $2}' | cut -d/ -f1)
-              echo "Pod IP: ${POD_IP}"
-
-              # Overwrite daemon.json: cgroup v2 + pod IP as DNS (works for ALL Docker networks)
-              echo "{\"default-cgroupns-mode\":\"host\",\"dns\":[\"${POD_IP}\"]}" > /etc/docker/daemon.json
-
-              # Get K8s CoreDNS from pod resolv.conf (reachable from DinD's own network namespace)
+              # Use K8s CoreDNS directly as Docker's DNS — nftables MASQUERADE rewrites the
+              # source IP (172.17.x.x → pod IP) so CoreDNS accepts queries from Docker containers.
               NAMESERVER=$(grep nameserver /etc/resolv.conf | head -1 | awk '{print $2}')
-              echo "DNS upstream: ${NAMESERVER}"
+              echo "DNS upstream (CoreDNS): ${NAMESERVER}"
+              echo "{\"default-cgroupns-mode\":\"host\",\"dns\":[\"${NAMESERVER}\"]}" > /etc/docker/daemon.json
 
-              # Allow DNS reply packets through Docker's FORWARD chain (both directions)
-              iptables -I FORWARD -p udp --dport 53 -j ACCEPT 2>/dev/null || true
-              iptables -I FORWARD -p udp --sport 53 -j ACCEPT 2>/dev/null || true
-
-              # Start DNS proxy before dockerd — listens on all interfaces including pod eth0
-              socat UDP4-LISTEN:53,reuseaddr,fork UDP4:${NAMESERVER}:53 &
+              # Set up nftables MASQUERADE for all Docker bridge traffic (172.16.0.0/12 covers
+              # Docker's default bridge range: 172.17-31.x.x). This allows inner Docker containers
+              # (openshell cluster nodes) to reach external registries and K8s services.
+              # iptables MASQUERADE is broken on k3s/rke2 (nftables-based), so we use nft directly.
+              nft add table ip nat 2>/dev/null || true
+              nft 'add chain ip nat POSTROUTING { type nat hook postrouting priority 100; }' 2>/dev/null || true
+              nft 'add rule ip nat POSTROUTING ip saddr 172.16.0.0/12 masquerade' 2>/dev/null || true
+              echo "nftables MASQUERADE rules applied for 172.16.0.0/12"
 
               exec dockerd --host=unix:///var/run/docker.sock
           volumeMounts:
@@ -137,6 +132,23 @@ spec:
               done
               docker info >/dev/null 2>&1 || { echo "Docker not ready"; exit 1; }
               echo "Docker ready"
+
+              # Background: stream logs from any Docker container that appears (gateway debug)
+              (
+                echo "[monitor] Watching for Docker containers..."
+                while true; do
+                  for CID in $(docker ps -q 2>/dev/null); do
+                    NAME=$(docker inspect --format '{{.Name}}' $CID 2>/dev/null | tr -d /)
+                    LOGFILE="/tmp/gateway-${NAME}.log"
+                    if [ ! -f "$LOGFILE" ]; then
+                      touch "$LOGFILE"
+                      echo "[monitor] Streaming logs for container: $NAME ($CID)"
+                      docker logs -f "$CID" 2>&1 | sed "s/^/[gateway:$NAME] /" &
+                    fi
+                  done
+                  sleep 1
+                done
+              ) &
 
               # Run official NemoClaw installer
               echo "[5/5] Running NemoClaw installer..."
